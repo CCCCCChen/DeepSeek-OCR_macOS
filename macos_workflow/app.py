@@ -3,6 +3,14 @@ import os
 import tempfile
 import time
 from PIL import Image
+import io
+import base64
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+import uuid
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure the root path is added so we can import our modules
 import sys
@@ -21,6 +29,15 @@ if project_root not in sys.path:
 from macos_workflow.ocr_engine_macos import OCREngine
 from macos_workflow import config_macos as config
 from macos_workflow.utils import re_match, draw_bounding_boxes, pdf_to_images, save_images_to_pdf
+
+# FastAPI app to host APIs alongside Gradio
+api_app = FastAPI(title="DeepSeek-OCR macOS API", version="1.0.0")
+
+# In-memory task store and executor for async OCR jobs
+TASKS = {}
+HASH_TO_TASKS = {}
+TASKS_LOCK = threading.Lock()
+EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 # --- Internationalization (i18n) Strings ---
 I18N_STRINGS = {
@@ -280,6 +297,218 @@ def run_pdf_ocr_task(pdf_file, task: str, custom_prompt: str, resolution_key: st
     status = get_i18n_text(lang, "status_pdf_success", pages=len(page_images), time=total_time)
     return final_md, None, md_path, pdf_out_path, status
 
+# --- API Helpers and Endpoints ---
+def _encode_image_to_base64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+@api_app.post("/api/ocr/image")
+async def ocr_image_api(
+    file: UploadFile = File(...),
+    task: str = Form(default=list(TASK_PROMPTS.keys())[0]),
+    custom_prompt: str = Form(default=""),
+    resolution_key: str = Form(default=list(RESOLUTION_MODES.keys())[0]),
+    lang: str = Form(default="简体中文"),
+):
+    try:
+        data = await file.read()
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        markdown, annotated_image, _, _, status = run_image_ocr_task(
+            image=image,
+            task=task,
+            custom_prompt=custom_prompt,
+            resolution_key=resolution_key,
+            lang=lang,
+        )
+        result = {"markdown": markdown, "status": status}
+        if annotated_image is not None:
+            result["annotated_image_base64"] = _encode_image_to_base64(annotated_image)
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@api_app.post("/api/ocr/pdf")
+async def ocr_pdf_api(
+    file: UploadFile = File(...),
+    task: str = Form(default=list(TASK_PROMPTS.keys())[0]),
+    custom_prompt: str = Form(default=""),
+    resolution_key: str = Form(default=list(RESOLUTION_MODES.keys())[0]),
+    lang: str = Form(default="简体中文"),
+):
+    try:
+        data = await file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        class _TempUpload:
+            def __init__(self, name):
+                self.name = name
+
+        markdown, _, _, _, status = run_pdf_ocr_task(
+            pdf_file=_TempUpload(tmp_path),
+            task=task,
+            custom_prompt=custom_prompt,
+            resolution_key=resolution_key,
+            lang=lang,
+        )
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return JSONResponse(content={"markdown": markdown, "status": status})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- Async Task Orchestration ---
+def _encode_result_image(annotated_image: Image.Image):
+    if annotated_image is None:
+        return None
+    try:
+        return _encode_image_to_base64(annotated_image)
+    except Exception:
+        return None
+
+def _set_task_fields(task_id: str, **fields):
+    with TASKS_LOCK:
+        if task_id in TASKS:
+            TASKS[task_id].update(fields)
+
+def _process_task(task_id: str):
+    with TASKS_LOCK:
+        rec = TASKS.get(task_id)
+    if not rec:
+        return
+    _set_task_fields(task_id, status="running")
+    try:
+        # Ensure engine is initialized for this language
+        initialize_engine(rec.get("lang", "简体中文"))
+
+        if rec["detected_type"] == "image":
+            image = Image.open(io.BytesIO(rec["data"]))
+            markdown, annotated_image, _, _, status_text = run_image_ocr_task(
+                image=image,
+                task=rec["task"],
+                custom_prompt=rec["custom_prompt"],
+                resolution_key=rec["resolution_key"],
+                lang=rec["lang"],
+            )
+            result = {"markdown": markdown, "status": status_text}
+            encoded = _encode_result_image(annotated_image)
+            if encoded:
+                result["annotated_image_base64"] = encoded
+        else:  # pdf
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(rec["data"])
+                tmp_path = tmp.name
+            class _TempUpload:
+                def __init__(self, name):
+                    self.name = name
+            markdown, _, _, _, status_text = run_pdf_ocr_task(
+                pdf_file=_TempUpload(tmp_path),
+                task=rec["task"],
+                custom_prompt=rec["custom_prompt"],
+                resolution_key=rec["resolution_key"],
+                lang=rec["lang"],
+            )
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            result = {"markdown": markdown, "status": status_text}
+
+        _set_task_fields(task_id, status="completed", result=result)
+    except Exception as e:
+        _set_task_fields(task_id, status="failed", error=str(e))
+
+def _detect_file_type(data: bytes, content_type: str | None) -> str:
+    try:
+        if data[:4] == b"%PDF" or (content_type and "pdf" in content_type.lower()):
+            return "pdf"
+        # Quick image validation
+        im = Image.open(io.BytesIO(data))
+        im.verify()
+        return "image"
+    except Exception:
+        return "unknown"
+
+@api_app.post("/api/ocr/start")
+async def ocr_start_api(
+    file: UploadFile = File(...),
+    task: str = Form(default=list(TASK_PROMPTS.keys())[0]),
+    custom_prompt: str = Form(default=""),
+    resolution_key: str = Form(default=list(RESOLUTION_MODES.keys())[0]),
+    lang: str = Form(default="简体中文"),
+):
+    try:
+        data = await file.read()
+        file_hash = hashlib.sha256(data).hexdigest()
+        detected_type = _detect_file_type(data, file.content_type)
+        if detected_type == "unknown":
+            return JSONResponse(status_code=400, content={"error": "Unsupported file type. Provide an image or a PDF."})
+
+        task_id = uuid.uuid4().hex
+        record = {
+            "task_id": task_id,
+            "file_hash": file_hash,
+            "detected_type": detected_type,
+            "status": "queued",
+            "task": task,
+            "custom_prompt": custom_prompt,
+            "resolution_key": resolution_key,
+            "lang": lang,
+            "data": data,
+        }
+        with TASKS_LOCK:
+            TASKS[task_id] = record
+            HASH_TO_TASKS.setdefault(file_hash, []).append(task_id)
+
+        # Submit async processing
+        EXECUTOR.submit(_process_task, task_id)
+
+        return JSONResponse(content={
+            "task_id": task_id,
+            "file_hash": file_hash,
+            "detected_type": detected_type,
+        })
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@api_app.get("/api/ocr/status")
+async def ocr_status_api(task_id: str | None = None, file_hash: str | None = None):
+    try:
+        with TASKS_LOCK:
+            record = None
+            if task_id:
+                record = TASKS.get(task_id)
+            elif file_hash:
+                ids = HASH_TO_TASKS.get(file_hash)
+                if ids:
+                    record = TASKS.get(ids[-1])
+            else:
+                return JSONResponse(status_code=400, content={"error": "Provide task_id or file_hash"})
+
+        if not record:
+            return JSONResponse(status_code=404, content={"error": "Task not found"})
+
+        response = {
+            "task_id": record["task_id"],
+            "file_hash": record["file_hash"],
+            "detected_type": record["detected_type"],
+            "status": record["status"],
+        }
+        if record["status"] == "completed":
+            response["result"] = record.get("result", {})
+        elif record["status"] == "failed":
+            response["error"] = record.get("error", "")
+
+        return JSONResponse(content=response)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 def update_custom_prompt_visibility(task: str, lang: str):
     return gr.update(visible=(task == get_i18n_text(lang, "task_grounding")))
 
@@ -417,6 +646,8 @@ def create_ui():
     return demo
 
 if __name__ == "__main__":
-    app = create_ui()
-    # app.launch(show_error=True)
-    app.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
+    # Mount Gradio UI at root path and run FastAPI with Uvicorn
+    ui = create_ui()
+    api_app = gr.mount_gradio_app(api_app, ui, path="/")
+    import uvicorn
+    uvicorn.run(api_app, host="0.0.0.0", port=7860, log_level="info")

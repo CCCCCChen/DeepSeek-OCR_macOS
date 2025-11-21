@@ -9,3 +9,5 @@ addict
 Pillow
 numpy
 gradio
+fastapi
+uvicorn
